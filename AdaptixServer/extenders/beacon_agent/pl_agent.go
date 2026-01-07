@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Adaptix-Framework/axc2"
+	adaptix "github.com/Adaptix-Framework/axc2"
 )
 
 type GenerateConfig struct {
@@ -42,8 +42,9 @@ var (
 	ObjectDir_smb  = "objects_smb"
 	ObjectDir_tcp  = "objects_tcp"
 	ObjectFiles    = [...]string{"Agent", "AgentConfig", "AgentInfo", "ApiLoader", "beacon_functions", "Boffer", "Commander", "Crypt", "Downloader", "Encoders", "JobsController", "MainAgent", "MemorySaver", "Packer", "Pivotter", "ProcLoader", "Proxyfire", "std", "utils", "WaitMask"}
-	CFlags         = "-c -fno-builtin -fno-unwind-tables -fno-strict-aliasing -fno-ident -fno-stack-protector -fno-exceptions -fno-asynchronous-unwind-tables -fno-strict-overflow -fno-delete-null-pointer-checks -fpermissive -w -masm=intel -fPIC"
-	LFlags         = "-Os -s -Wl,-s,--gc-sections -static-libgcc -mwindows"
+	CFlags         = "-c -fno-builtin -fno-unwind-tables -fno-strict-aliasing -fno-ident -fno-stack-protector -fno-exceptions -fno-asynchronous-unwind-tables -fno-strict-overflow -fno-delete-null-pointer-checks -fpermissive -w -masm=intel -fPIC -fno-sanitize=all"
+	LFlags         = "-Os -s -Wl,-s,--gc-sections -static-libgcc -mwindows -Wl,--subsystem,windows"
+	//LFlags = "-Os -s -Wl,-s,--gc-sections,--allow-multiple-definition -mwindows -nodefaultlibs -lmingw32 -lgcc -lgcc_eh -lmingwex -lucrtbase -lkernel32 -luser32 -ladvapi32 -lshell32 -lws2_32 -lwininet -liphlpapi -static-libgcc -static-libstdc++"
 )
 
 func AgentGenerateProfile(agentConfig string, listenerWM string, listenerMap map[string]any) ([]byte, error) {
@@ -243,12 +244,12 @@ func AgentGenerateBuild(agentConfig string, agentProfile []byte, listenerMap map
 	}
 
 	if generateConfig.Arch == "x86" {
-		Compiler = "i686-w64-mingw32-g++"
+		Compiler = "zig c++ -target x86-windows-gnu"
 		Ext = ".x86.o"
 		stubPath = currentDir + "/" + ObjectDir + "/stub.x86.bin"
 		Filename = "agent.x86"
 	} else {
-		Compiler = "x86_64-w64-mingw32-g++"
+		Compiler = "zig c++ -target x86_64-windows-gnu"
 		Ext = ".x64.o"
 		stubPath = currentDir + "/" + ObjectDir + "/stub.x64.bin"
 		Filename = "agent.x64"
