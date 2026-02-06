@@ -251,6 +251,12 @@ type AnsExecBof struct {
 	Msgs []byte `msgpack:"msgs"`
 }
 
+// AnsExecBofOut is for async job output streaming (COMMAND_EXEC_BOF_OUT)
+type AnsExecBofOut struct {
+	Type int    `msgpack:"type"`
+	Data []byte `msgpack:"data"`
+}
+
 const (
 	COMMAND_ERROR      = 0
 	COMMAND_PWD        = 1
@@ -285,12 +291,13 @@ const (
 	COMMAND_EXEC_BOF     = 50
 	COMMAND_EXEC_BOF_OUT = 51
 
-	CALLBACK_OUTPUT      = 0x0
-	CALLBACK_OUTPUT_OEM  = 0x1e
-	CALLBACK_OUTPUT_UTF8 = 0x20
-	CALLBACK_ERROR       = 0x0d
-	CALLBACK_CUSTOM      = 0x1000
-	CALLBACK_CUSTOM_LAST = 0x13ff
+	CALLBACK_OUTPUT       = 0x0
+	CALLBACK_OUTPUT_OEM   = 0x1e
+	CALLBACK_OUTPUT_UTF8  = 0x20
+	CALLBACK_JOB_FINISHED = 0x30
+	CALLBACK_ERROR        = 0x0d
+	CALLBACK_CUSTOM       = 0x1000
+	CALLBACK_CUSTOM_LAST  = 0x13ff
 
 	CALLBACK_AX_SCREENSHOT   = 0x81
 	CALLBACK_AX_DOWNLOAD_MEM = 0x82

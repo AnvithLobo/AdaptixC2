@@ -310,9 +310,23 @@ func (t *TransportTCP) handleConnection(conn net.Conn, ts Teamserver) {
 
 				_ = Ts.TsAgentProcessData(agentId, recvData)
 			} else {
-				if !isClientConnected(conn, t.Config.Ssl) {
-					break
+				// Poll for unsolicited data (e.g. streaming output)
+				recvData, err = recvMsgPoll(conn, 100*time.Millisecond)
+				if err == nil && recvData != nil {
+
+					_ = Ts.TsAgentSetTick(agentId, t.Name)
+					_ = Ts.TsAgentProcessData(agentId, recvData)
+				} else if err != nil {
+					// Check if it's a timeout
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						// It's a timeout, effectively idle. Continue loop.
+					} else {
+						// Real error (EOF, Closed), break loop
+						break
+					}
 				}
+				// isClientConnected removed because it destructively reads data
+				time.Sleep(50 * time.Millisecond)
 			}
 		}
 
@@ -600,6 +614,42 @@ func recvMsg(conn net.Conn) ([]byte, error) {
 	}
 	msgLen := binary.BigEndian.Uint32(bufLen)
 
+	return connRead(conn, int(msgLen))
+}
+
+func recvMsgPoll(conn net.Conn, timeout time.Duration) ([]byte, error) {
+	header := make([]byte, 4)
+	readCount := 0
+
+	conn.SetReadDeadline(time.Now().Add(timeout))
+
+	for readCount < 4 {
+		n, err := conn.Read(header[readCount:])
+		readCount += n
+
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if readCount == 0 {
+					// True timeout (idle)
+					conn.SetReadDeadline(time.Time{})
+					return nil, err
+				}
+				// Partial read, clear deadline and continue blocking to finish header
+				conn.SetReadDeadline(time.Time{})
+				continue
+			}
+			return nil, err
+		}
+
+		// If we started reading, clear deadline to avoid timeout mid-header
+		if readCount > 0 {
+			conn.SetReadDeadline(time.Time{})
+		}
+	}
+
+	conn.SetReadDeadline(time.Time{})
+
+	msgLen := binary.BigEndian.Uint32(header)
 	return connRead(conn, int(msgLen))
 }
 

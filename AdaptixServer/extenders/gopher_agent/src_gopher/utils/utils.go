@@ -13,6 +13,16 @@ type Connection struct {
 	JobCancel    context.CancelFunc
 }
 
+// ProcessJobData holds info for jobs that need pipe output polling
+type ProcessJobData struct {
+	TaskId   uint32
+	JobType  int
+	JobState int
+	HProcess uintptr
+	Pid      uint16
+	PipeRead uintptr // Windows HANDLE stored as uintptr
+}
+
 /// Listener
 
 const (
@@ -21,6 +31,22 @@ const (
 	JOB_PACK     = 3
 	JOB_TUNNEL   = 4
 	JOB_TERMINAL = 5
+)
+
+// Job types (matching C++ JobsController)
+const (
+	JOB_TYPE_LOCAL   = 1
+	JOB_TYPE_REMOTE  = 2
+	JOB_TYPE_PROCESS = 3
+	JOB_TYPE_SHELL   = 4
+)
+
+// Job states (matching C++ JobsController)
+const (
+	JOB_STATE_STARTING = 0
+	JOB_STATE_RUNNING  = 1
+	JOB_STATE_KILLED   = 2
+	JOB_STATE_FINISHED = 3
 )
 
 type StartMsg struct {
@@ -301,6 +327,12 @@ type AnsExecBof struct {
 	Msgs []byte `msgpack:"msgs"`
 }
 
+// AnsExecBofOut is for async job output streaming (COMMAND_EXEC_BOF_OUT)
+type AnsExecBofOut struct {
+	Type int    `msgpack:"type"`
+	Data []byte `msgpack:"data"`
+}
+
 type ParamsTunnelPause struct {
 	ChannelId int `msgpack:"channel_id"`
 }
@@ -342,4 +374,10 @@ const (
 
 	COMMAND_EXEC_BOF     = 50
 	COMMAND_EXEC_BOF_OUT = 51
+
+	CALLBACK_OUTPUT       = 0x0
+	CALLBACK_OUTPUT_OEM   = 0x1e
+	CALLBACK_OUTPUT_UTF8  = 0x20
+	CALLBACK_JOB_FINISHED = 0x30
+	CALLBACK_ERROR        = 0x0d
 )

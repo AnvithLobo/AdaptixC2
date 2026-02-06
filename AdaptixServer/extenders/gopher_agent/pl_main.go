@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Adaptix-Framework/axc2"
+	adaptix "github.com/Adaptix-Framework/axc2"
 	"github.com/google/shlex"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -1027,7 +1027,8 @@ func (ext *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData
 		return errors.New("failed to unmarshal message")
 	}
 
-	if inMessage.Type == 1 {
+	// Accept Type 1 (Response), Type 0 (Checkin), or Type 30 (Custom Streaming)
+	if inMessage.Type == 1 || inMessage.Type == 0 || inMessage.Type == 30 {
 
 		for _, cmdBytes := range inMessage.Object {
 			err = msgpack.Unmarshal(cmdBytes, &cmd)
@@ -1124,6 +1125,33 @@ func (ext *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData
 						task.ClearText += Ts.TsConvertCpToUTF8(string(msg.Data), agentData.ACP) + "\n"
 					}
 				}
+
+			case COMMAND_EXEC_BOF_OUT:
+				// Handler for async job output streaming (same pattern as C++ beacon)
+				var params AnsExecBofOut
+				err := msgpack.Unmarshal(cmd.Data, &params)
+				if err != nil {
+					continue
+				}
+
+				if params.Type == CALLBACK_ERROR {
+					task.MessageType = adaptix.MESSAGE_ERROR
+					task.Message = "Job error"
+					task.ClearText = Ts.TsConvertCpToUTF8(string(params.Data), agentData.ACP)
+				} else if params.Type == CALLBACK_JOB_FINISHED {
+					task.Message = "Job finished"
+					task.Completed = true
+				} else if params.Type == CALLBACK_OUTPUT_OEM {
+					task.Message = "Job output"
+					task.ClearText = Ts.TsConvertCpToUTF8(string(params.Data), agentData.OemCP)
+				} else {
+					// CALLBACK_OUTPUT_UTF8 or any other type
+					task.Message = "Job output"
+					task.ClearText = string(params.Data)
+				}
+
+				// Keep task open for subsequent output
+				task.Completed = false
 
 			case COMMAND_EXIT:
 				task.Message = "The agent has completed its work (kill process)"
@@ -1752,6 +1780,33 @@ func (ext *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData
 				if params.Finish {
 					task.Message = fmt.Sprintf("Process [%v] with pid '%v' finished", task.TaskId, params.Pid)
 					task.Completed = true
+				}
+
+			case COMMAND_EXEC_BOF:
+				// Handle async BOF output from registerJob
+				var params AnsExecBof
+				err := msgpack.Unmarshal(job.Data, &params)
+				if err != nil {
+					goto HANDLER
+				}
+
+				var msgs []BofMsg
+				err = msgpack.Unmarshal(params.Msgs, &msgs)
+				if err != nil {
+					goto HANDLER
+				}
+
+				task.Message = "BOF output"
+				task.Completed = false
+
+				for _, msg := range msgs {
+					if msg.Type == CALLBACK_ERROR {
+						task.MessageType = adaptix.MESSAGE_ERROR
+						task.Message = "BOF error"
+						task.ClearText += Ts.TsConvertCpToUTF8(string(msg.Data), agentData.ACP) + "\n"
+					} else {
+						task.ClearText += Ts.TsConvertCpToUTF8(string(msg.Data), agentData.ACP) + "\n"
+					}
 				}
 
 			default:

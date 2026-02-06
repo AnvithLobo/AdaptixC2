@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/kbinani/screenshot"
 )
@@ -382,7 +383,43 @@ func RecvMsg(conn net.Conn) ([]byte, error) {
 	return ConnRead(conn, int(msgLen))
 }
 
+func RecvMsgPoll(conn net.Conn, timeout time.Duration) ([]byte, error) {
+	header := make([]byte, 4)
+	readCount := 0
+
+	conn.SetReadDeadline(time.Now().Add(timeout))
+
+	for readCount < 4 {
+		n, err := conn.Read(header[readCount:])
+		readCount += n
+
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if readCount == 0 {
+					// True timeout (idle)
+					return nil, err
+				}
+				// Partial read, clear deadline and continue blocking to finish header
+				conn.SetReadDeadline(time.Time{})
+				continue
+			}
+			return nil, err
+		}
+
+		// If we started reading, clear deadline to avoid timeout mid-header
+		if readCount > 0 {
+			conn.SetReadDeadline(time.Time{})
+		}
+	}
+
+	conn.SetReadDeadline(time.Time{})
+
+	msgLen := binary.BigEndian.Uint32(header)
+	return ConnRead(conn, int(msgLen))
+}
+
 func SendMsg(conn net.Conn, data []byte) error {
+
 	if conn == nil {
 		return errors.New("conn is nil")
 	}

