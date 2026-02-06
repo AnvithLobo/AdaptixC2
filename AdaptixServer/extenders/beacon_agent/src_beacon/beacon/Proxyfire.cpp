@@ -534,6 +534,14 @@ ULONG Proxyfire::RecvProxy(Packer* packer)
 						}
 						break;
 					}
+					else {
+						char peekBuf[1];
+						int peekResult = ApiWin->recv(tunnelData->sock, peekBuf, 1, MSG_PEEK);
+						if (peekResult == 0) {
+							tunnelData->state = TUNNEL_STATE_CLOSE;
+							PackProxyStatus(packer, tunnelData->channelID, COMMAND_TUNNEL_START_TCP, tunnelData->type, TUNNEL_CREATE_ERROR);
+						}
+					}
 				}
 			}
 		}
