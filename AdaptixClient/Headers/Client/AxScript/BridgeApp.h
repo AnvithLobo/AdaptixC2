@@ -44,6 +44,7 @@ public Q_SLOTS:
     QString  decode_file(const QString &algorithm, const QString &path, const QString &key = QString()) const;
     QString  encode_data(const QString &algorithm, const QString &data, const QString &key = QString()) const;
     QString  encode_file(const QString &algorithm, const QString &path, const QString &key = QString()) const;
+    QString  donut_generate(const QString &file, const QString &params, const QString &arch, const QString &pipeName, const QString &stubBase64, int compress, int entropy, int exit_opt, int bypass, int headers);
     void     execute_alias(const QString &id, const QString &cmdline, const QString &command, const QString &message = "", const QJSValue &hook = QJSValue(), const QJSValue &handler = QJSValue()) const;
     void     execute_alias_hook(const QString &id, const QString &cmdline, const QString &command, const QString &message, const QJSValue &hook) const;
     void     execute_alias_handler(const QString &id, const QString &cmdline, const QString &command, const QString &message, const QJSValue &handler) const;
